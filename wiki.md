@@ -40,7 +40,7 @@ The default variable name is controlled by `gitea.token_env` in `config.json`.
 
 ## Configuration
 
-On first run, `config.json` is created from `config_default.json`.
+On first run, `config.json` is created from `config-default.json`.
 
 Set at minimum:
 

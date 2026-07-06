@@ -54,6 +54,21 @@ import customtkinter as ctk
 Json = t.Dict[str, t.Any]
 
 
+def configure_stdio_encoding() -> None:
+  """
+  Keep console logging usable on Windows consoles that default to cp1252.
+  """
+  for stream_name in ("stdout", "stderr"):
+    stream = getattr(sys, stream_name, None)
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+      continue
+    try:
+      reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+      pass
+
+
 # =============================================================================
 # Paths
 # =============================================================================
@@ -225,6 +240,18 @@ def _ansi_strip(s: str) -> str:
   return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", s)
 
 
+def _repair_mojibake(s: str) -> str:
+  """
+  Repair common UTF-8 text that was decoded as Windows-1252.
+  """
+  if not any(marker in s for marker in ("Ã", "Â", "â", "ð", "ï")):
+    return s
+  try:
+    return s.encode("cp1252").decode("utf-8")
+  except Exception:
+    return s
+
+
 def _logger_write_line(line: str) -> None:
   """
   Write a single line to the log file if enabled/open.
@@ -233,7 +260,7 @@ def _logger_write_line(line: str) -> None:
   if _LOG_FILE_HANDLE is None:
     return
   try:
-    _LOG_FILE_HANDLE.write(_ansi_strip(line) + "\n")
+    _LOG_FILE_HANDLE.write(_ansi_strip(_repair_mojibake(line)) + "\n")
     _LOG_FILE_HANDLE.flush()
   except Exception:
     pass
@@ -308,6 +335,24 @@ def _logger_init_from_cfg(cfg: Json, *, script_dir: str) -> None:
     _LOG_FILE_HANDLE = None
     _LOG_FILE_PATH = None
 
+    fallback_log_dir = os.path.join(script_dir, default_dir_name)
+    if os.path.normcase(os.path.abspath(fallback_log_dir)) == os.path.normcase(os.path.abspath(log_dir)):
+      return
+
+    try:
+      os.makedirs(fallback_log_dir, exist_ok=True)
+      path = os.path.join(fallback_log_dir, file_name)
+
+      _LOG_FILE_HANDLE = open(path, "a", encoding="utf-8", buffering=1)
+      _LOG_FILE_PATH = path
+
+      print(f"[LOG] Writing log file: {path}")
+      _logger_write_line(f"[LOG] Writing log file: {path}")
+    except Exception as e:
+      _LOG_FILE_HANDLE = None
+      _LOG_FILE_PATH = None
+      print(f"[WARN] File logging disabled: {e}")
+
 
 def _emit_to_sinks(line: str) -> None:
   """
@@ -333,7 +378,7 @@ def _log(tag: str, msg: str) -> None:
   """
   Log one line with a tag.
   """
-  line = f"{tag} {msg}"
+  line = _repair_mojibake(f"{tag} {msg}")
   print(line)
   _logger_write_line(line)
   _emit_to_sinks(line)
@@ -438,6 +483,23 @@ def load_config(config_default_path: str, config_path: str) -> Json:
   return cfg
 
 
+def resolve_config_default_path(script_dir: str) -> str:
+  """
+  Return the config template path shipped with this project.
+
+  Older docs/code used config_default.json, while the repository currently ships
+  config-default.json. Support both so existing local setups keep working.
+  """
+  candidates = [
+    os.path.join(script_dir, "config_default.json"),
+    os.path.join(script_dir, "config-default.json"),
+  ]
+  for path in candidates:
+    if os.path.exists(path):
+      return path
+  return candidates[0]
+
+
 # =============================================================================
 # HTTP (requests)
 # =============================================================================
@@ -539,18 +601,19 @@ def _run(cmd: t.List[str], cwd: str | None = None, dry_run: bool = False) -> int
   # Enable git + ssh tracing so the REAL executed commands are visible
   env.setdefault("GIT_TRACE", "1")
 
-  p = subprocess.run(
+  with subprocess.Popen(
     cmd,
     cwd=cwd,
     env=env,
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
     text=True,
-  )
-  if p.stdout:
-    for line in p.stdout.splitlines():
-      _log("[📜 OUT]", line)
-  return p.returncode
+    bufsize=1,
+  ) as p:
+    if p.stdout:
+      for line in p.stdout:
+        _log("[📜 OUT]", line.rstrip("\r\n"))
+    return p.wait()
 
 
 def _git(
@@ -597,6 +660,23 @@ def _git_post_update_gc(
       _log("[WARN]", f"Post-update cleanup step failed: {' '.join(args)}")
       break
   return ok
+
+
+def _git_repo_has_refs(git_exe: str, repo_path: str, dry_run: bool) -> bool:
+  """
+  Return True when a mirror has at least one ref.
+  """
+  if dry_run:
+    return True
+
+  p = subprocess.run(
+    [git_exe, "show-ref", "--quiet"],
+    cwd=repo_path,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    text=True,
+  )
+  return p.returncode == 0
 
 
 def _is_git_repo(path: str) -> bool:
@@ -860,6 +940,54 @@ def _manifest_path(cfg: Json) -> str:
   name = LogicalPath(t.cast(str, cfg["sync"]["manifest_file_name"]))
   return name.to_os(base.to_os())
 
+
+def _sanitize_manifest(m: Json, *, path: str) -> Json:
+  if not isinstance(m, dict):
+    raise ValueError("manifest root is not an object")
+
+  managed_raw = m.get("managed") or {}
+  if not isinstance(managed_raw, dict):
+    _log("[WARN]", f"Manifest managed section is not an object; ignoring managed entries: {path}")
+    managed_raw = {}
+
+  managed_clean: Json = {}
+  for full_name_raw, info_raw in managed_raw.items():
+    full_name = str(full_name_raw or "").strip()
+    if not full_name:
+      _log("[WARN]", "Ignoring manifest entry with empty repository name.")
+      continue
+    if not isinstance(info_raw, dict):
+      _log("[WARN]", f"Ignoring malformed manifest entry for {full_name!r}: entry is not an object.")
+      continue
+
+    info = dict(info_raw)
+    rel_raw = str(info.get("rel_path") or "").strip()
+    if not rel_raw:
+      _log("[WARN]", f"Ignoring malformed manifest entry for {full_name!r}: missing rel_path.")
+      continue
+
+    try:
+      rel = LogicalPath(rel_raw)
+      parts = [part for part in str(rel).split("/") if part]
+      if not parts or any(part in (".", "..") for part in parts):
+        raise ValueError(f"unsafe rel_path: {rel_raw!r}")
+      info["rel_path"] = str(rel)
+    except Exception as e:
+      _log("[WARN]", f"Ignoring malformed manifest entry for {full_name!r}: {e}")
+      continue
+
+    managed_clean[full_name] = t.cast(Json, info)
+
+  try:
+    m["version"] = int(m.get("version") or 2)
+  except Exception:
+    _log("[WARN]", f"Manifest version is invalid; using version 2: {path}")
+    m["version"] = 2
+  m["managed"] = managed_clean
+  m["last_sync_at"] = str(m.get("last_sync_at") or "")
+  return m
+
+
 def _load_manifest(cfg: Json) -> Json:
   path = _manifest_path(cfg)
   if os.path.exists(path):
@@ -867,12 +995,7 @@ def _load_manifest(cfg: Json) -> Json:
       m = _read_json_file(path)
 
       # 🔒 normalize rel_path fields defensively
-      for info in (m.get("managed") or {}).values():
-        if "rel_path" in info:
-          # Defensive only: legacy manifests or manual edits
-          info["rel_path"] = str(LogicalPath(info["rel_path"]))
-
-      return m
+      return _sanitize_manifest(t.cast(Json, m), path=path)
     except Exception:
       _log("[⚠️ WARN]", f"Failed to read manifest, starting fresh: {path}")
 
@@ -1153,12 +1276,15 @@ def _sync_one_repo(
     if rc != 0:
       raise RuntimeError(f"Clone failed: {repo.get('full_name')}")
     if t.cast(bool, cfg["sync"].get("post_update_gc", False)):
-      _git_post_update_gc(
-        git_exe,
-        dest_abs,
-        dry_run=dry_run,
-        extra_git_config=extra_cfg,
-      )
+      if _git_repo_has_refs(git_exe, dest_abs, dry_run=dry_run):
+        _git_post_update_gc(
+          git_exe,
+          dest_abs,
+          dry_run=dry_run,
+          extra_git_config=extra_cfg,
+        )
+      else:
+        _log("[GC]", f"Skipping post-clone cleanup for empty mirror: {dest_abs}")
     return True
 
   # Update existing
@@ -1834,7 +1960,7 @@ def _gui() -> int:
     return 3
 
   script_dir = os.path.dirname(os.path.abspath(__file__))
-  default_config_default = os.path.join(script_dir, "config_default.json")
+  default_config_default = resolve_config_default_path(script_dir)
   default_config = os.path.join(script_dir, "config.json")
 
   ensure_config_json_exists(default_config_default, default_config)
@@ -3640,12 +3766,14 @@ def main(argv: t.List[str]) -> int:
   Optional:
   - --headless  : run once using config files and exit (no GUI)
   """
+  configure_stdio_encoding()
+
   # Must happen early for best taskbar behavior on Windows.
   set_windows_app_user_model_id(APP_USER_MODEL_ID)
 
   script_dir = os.path.dirname(os.path.abspath(__file__))
 
-  default_config_default = os.path.join(script_dir, "config_default.json")
+  default_config_default = resolve_config_default_path(script_dir)
   default_config = os.path.join(script_dir, "config.json")
 
   ensure_config_json_exists(default_config_default, default_config)

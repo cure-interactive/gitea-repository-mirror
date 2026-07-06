@@ -36,7 +36,7 @@ On Linux or macOS, activate the virtual environment with `source .venv/bin/activ
 
 ## Configure
 
-On first run, the app creates `config.json` from `config_default.json`.
+On first run, the app creates `config.json` from `config-default.json`.
 
 Set at minimum:
 
